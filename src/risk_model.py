@@ -1,26 +1,60 @@
+# src/risk_model.py
+
 import pandas as pd
-from .normalize import norm_text, infer_flavour_label, RISK_MAP
+import numpy as np
 
-def build_product_risk_profile(df_form):
-    form = df_form.copy()
-    form['Date_parsed'] = pd.to_datetime(form.get('Date'), errors='coerce')
-    form['Product_name'] = form.get('Product name').astype(str)
-    form['Product_norm'] = form['Product_name'].map(norm_text)
+# -----------------------------
+# SIMPLE RISK MAP (EDIT LATER)
+# -----------------------------
+RISK_MAP = {
+    "strawberry": 2,
+    "vanilla": 1,
+    "chocolate": 1,
+    "mixed berry": 3,
+    "unknown": 4,
+}
 
-    flavour_col = 'Flavour name' if 'Flavour name' in form.columns else ''
-    form['Flavour_label'] = [
-        infer_flavour_label(p, f)
-        for p, f in zip(form['Product_name'], form.get(flavour_col, '').astype(str))
-    ]
-    form['Risk_score'] = form['Flavour_label'].map(RISK_MAP).fillna(5).astype(float)
+# -----------------------------
+# TEXT NORMALISATION
+# -----------------------------
+def norm_text(val):
+    if pd.isna(val):
+        return ""
+    return str(val).strip().lower()
 
-    prof = (
-        form.groupby('Product_norm', as_index=False)
-        .agg(
-            hist_entries=('Product_norm', 'size'),
-            hist_risk_median=('Risk_score', 'median'),
-            hist_risk_mean=('Risk_score', 'mean'),
-            hist_common_flavour=('Flavour_label', lambda s: s.value_counts().index[0] if len(s.dropna()) else 'other')
-        )
-    )
-    return prof
+# -----------------------------
+# FLAVOUR INFERENCE
+# -----------------------------
+def infer_flavour_label(row):
+    name = norm_text(row.get("product_name", ""))
+    flavour = norm_text(row.get("flavour_name", ""))
+
+    for key in RISK_MAP:
+        if key in name or key in flavour:
+            return key
+
+    return "unknown"
+
+# -----------------------------
+# ROW-LEVEL RISK SCORING
+# -----------------------------
+def _score_row(row):
+    flavour = infer_flavour_label(row)
+    base_risk = RISK_MAP.get(flavour, 4)
+
+    pack_size = row.get("pack_size_g", np.nan)
+
+    # simple rule: bigger packs = higher risk
+    if not pd.isna(pack_size) and pack_size >= 500:
+        base_risk += 1
+
+    return min(base_risk, 5)
+
+# -----------------------------
+# ✅ REQUIRED FUNCTION (THIS WAS MISSING)
+# -----------------------------
+def score_risk(df: pd.DataFrame) -> pd.Series:
+    """
+    Returns a risk score per row (1–5)
+    """
+    return df.apply(_score_row, axis=1)

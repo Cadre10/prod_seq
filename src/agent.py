@@ -1,14 +1,34 @@
-from src.io_data import load_daily_plan, load_form_responses
+# src/agent.py
+
+import pandas as pd
+
+from src.normalize import normalize_data
+from src.risk_model import score_risk
+from src.sequencer import sequence_actions
+
 
 def main():
-    daily_path = "data/_Clandeboye Production Perfomance dashboard - Daily_Plan.csv"
-    form_path = "data/_Clandeboye Production Perfomance dashboard - Form_Responses.csv"
+    print("🔍 Yoghurt AI Agent starting...")
 
-    df_daily = load_daily_plan(daily_path)
-    df_form = load_form_responses(form_path)
+    # ---- LOAD DATA ----
+    df = pd.read_csv("data/input/Prod_Plan.csv")
+    print(f"✅ Loaded {len(df)} rows")
 
-    print(df_daily.head(3))
-    print(df_form.head(3))
+    # ---- NORMALISE ----
+    df= normalize_data(df)
+    print("✅ Data normalised")
+
+    # ---- SCORE RISK ----
+    df["risk_final"] = score_risk(df)
+    print("✅ Risk scored")
+
+    # ---- SEQUENCE ACTIONS ----
+    actions = sequence_actions(df)
+
+    print("\n📋 AGENT OUTPUT:")
+    for a in actions:
+        print("•", a)
+
 
 if __name__ == "__main__":
     main()
