@@ -234,6 +234,9 @@ def normalize_data(df: pd.DataFrame) -> pd.DataFrame:
 
     # Make sure it's not empty spaces
     df["product_name"] = df["product_name"].fillna("").astype(str).str.strip()
+# Drop rows with empty product_name (prevents UNKNOWN PRODUCT spam)
+    df["product_name"] = df["product_name"].fillna("").astype(str).str.strip()
+    df = df[df["product_name"] != ""].copy()
 
     # DEBUG (keep for now)
     print("DEBUG product column detected:", prod_col)
