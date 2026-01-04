@@ -1,7 +1,30 @@
 import re
 import pandas as pd
 import numpy as np
-import pandas as pd
+
+def detect_product_column(df: pd.DataFrame) -> str | None:
+    """
+    Try to find the column that contains product description/name.
+    Strong heuristic: column name contains 'product' and/or 'name' and/or 'description'.
+    """
+    cols = list(df.columns)
+    low = {c: str(c).strip().lower() for c in cols}
+
+    # best matches first
+    priority = [
+        lambda s: ("product" in s and "name" in s),
+        lambda s: ("product" in s and "desc" in s),
+        lambda s: ("description" in s),
+        lambda s: ("product" in s),
+        lambda s: ("item" in s and "name" in s),
+        lambda s: ("item" in s),
+    ]
+
+    for rule in priority:
+        for c in cols:
+            if rule(low[c]):
+                return c
+    return None
 
 def extract_pack_size_g(product_name: str):
     """Returns pack size in grams if found, else None.
@@ -185,10 +208,61 @@ def standardise_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 def normalize_data(df: pd.DataFrame) -> pd.DataFrame:
+    # Clean headers
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # --- Detect product column and create product_name ---
+    prod_col = detect_product_column(df)
+
+    if prod_col is not None:
+        df["product_name"] = df[prod_col].fillna("").astype(str).str.strip()
+    else:
+        # If no obvious product column, try to build from multiple likely columns
+        # (common in production plans)
+        possible_parts = []
+        for c in df.columns:
+            lc = c.lower()
+            if any(k in lc for k in ["product", "name", "desc", "flavour", "flavor", "variant", "size", "pack"]):
+                possible_parts.append(c)
+
+        if possible_parts:
+            df["product_name"] = (
+                df[possible_parts].fillna("").astype(str).agg(" ".join, axis=1).str.strip()
+            )
+        else:
+            df["product_name"] = ""
+
+    # Make sure it's not empty spaces
+    df["product_name"] = df["product_name"].fillna("").astype(str).str.strip()
+
+    # DEBUG (keep for now)
+    print("DEBUG product column detected:", prod_col)
+    print("DEBUG product_name sample:", df["product_name"].head(5).tolist())
+
+    # ... keep the rest of your normalize logic below ...
+
+
     def norm_text(val):
         if pd.isna(val):
             return ''
         return str(val).strip().lower()
+    return df
+    # Guarantee product_name exists (even if the input file uses other headings) if "product_name" not in df.columns:
+    # try common alternatives (case-insensitive)
+    lower_map = {c.lower(): c for c in df.columns}
+    for candidate in ["product", "product name", "product_name_plan", "product name_plan", "product name plan"]:
+        if candidate in lower_map:
+         df = df.rename(columns={lower_map[candidate]: "product_name"})
+        break
+# If still missing, create empty so downstream doesn't crash
+        if "product_name" not in df.columns:
+            df["product_name"] = ""
+
+    df["product_name"] = ""
+
+# Ensure it's filled and clean
+    df["product_name"] = df["product_name"].fillna("").astype(str).str.strip()
+
 def extract_pack_size_g(product_name):
     if pd.isna(product_name):
         return np.nan
