@@ -30,17 +30,37 @@ def extract_pack_size_g(product_name: str):
     """Returns pack size in grams if found, else None.
     Handles 150g, 450g, 2kg, 5kg, 10kg.
     """
+    mask_blank = df["product_name"].fillna("").astype(str).str.strip().eq("")
+    fallback_cols = []
+    for c in df.columns:
+      lc = c.lower()
+    if any(k in lc for k in ["code", "sku", "item", "desc", "description", "pack", "size", "variant", "flavour", "flavor"]):
+         fallback_cols.append(c)
+    if fallback_cols and mask_blank.any():
+    # Build a row-wise joined string safely
+        rebuilt = (
+    df.loc[mask_blank, fallback_cols]
+        .fillna("")
+        .astype(str)
+        .apply(lambda r: " ".join([x.strip() for x in r.tolist() if str(x).strip() != ""]), axis=1)
+    )
+    df.loc[mask_blank, "product_name"] = rebuilt
+    # Final cleanup and drop still-blank rows
+    df["product_name"] = df["product_name"].fillna("").astype(str).str.strip()
+    df = df[df["product_name"] != ""].copy()
+
+
     if product_name is None:
-        return None
+       return None
     s = str(product_name).lower()
 
     m_g = re.search(r"(\d+)\s*g\b", s)
     if m_g:
-        return int(m_g.group(1))
+     return int(m_g.group(1))
 
     m_kg = re.search(r"(\d+)\s*kg\b", s)
     if m_kg:
-        return int(m_kg.group(1)) * 1000
+     return int(m_kg.group(1)) * 1000
 
     return None
 
@@ -208,6 +228,16 @@ def standardise_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 def normalize_data(df: pd.DataFrame) -> pd.DataFrame:
+    df["is_plain_yoghurt"] = df.apply(
+    lambda r: is_plain_yoghurt(r.get("product_name", ""), r.get("flavour_label", "")),
+    axis=1
+)
+
+    df["machine"] = df.apply(
+    lambda r: assign_machine(r.get("product_name", ""), r.get("pack_size_g", None)),
+    axis=1
+)
+
     # Clean headers
     df.columns = [str(c).strip() for c in df.columns]
 
@@ -297,6 +327,34 @@ def infer_flavour_label(product_name, flavour_name=''):
         if any(k in s for k in kws):
             return lab
     return 'other'
+def is_plain_yoghurt(product_name: str, flavour_label: str = "") -> bool:
+    s = norm_text(product_name) + " " + norm_text(flavour_label)
+    # plain/natural/greek treated as plain for washdown/changeover logic
+    return any(k in s for k in ["plain", "natural", "greek"]) and not any(
+        k in s for k in ["strawberry", "blueberry", "raspberry", "mango", "honey", "vanilla", "toffee", "granola", "choc", "tophat"]
+    )
+
+def assign_machine(product_name: str, pack_size_g: float):
+    s = norm_text(product_name)
+
+    # Buckets line (2kg, 5kg, 10kg)
+    if pack_size_g in [2000, 5000, 10000] or "kg" in s:
+        return "BUCKET_LINE"
+
+    # Granola always on M3
+    if "granola" in s:
+        return "M3"
+
+    # 450g pots on M2
+    if pack_size_g == 450:
+        return "M2"
+
+    # M1 does 150g / 170g / 175g
+    if pack_size_g in [150, 170, 175]:
+        return "M1"
+
+    return "UNKNOWN_LINE"
+
 def is_plain_yoghurt(product_name: str) -> bool:
     if product_name is None:
         return False
