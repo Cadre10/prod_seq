@@ -2,6 +2,14 @@ import re
 import pandas as pd
 import numpy as np
 
+#from risk_model import norm_text#
+import pandas as pd
+
+def norm_text(val) -> str:
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return ""
+    return str(val).strip().lower().replace(".", " ").replace("_", " ")
+
 def detect_product_column(df: pd.DataFrame) -> str | None:
     """
     Try to find the column that contains product description/name.
@@ -68,31 +76,6 @@ def is_granola(product_name: str) -> bool:
     if product_name is None:
         return False
     return "granola" in str(product_name).lower()
-
-def is_plain_yoghurt(product_name: str) -> bool:
-    if product_name is None:
-        return False
-    s = str(product_name).lower()
-
-    plain_keywords = ["plain", "natural", "greek"]
-    flav_keywords = ["strawberry","raspberry","mango","blueberry","honey","vanilla","toffee","choc","berry"]
-
-    if any(k in s for k in flav_keywords):
-        return False
-    return any(k in s for k in plain_keywords)
-
-def norm_text(val) -> str:
-    if val is None:
-        return ""
-    return (
-        str(val)
-        .lower()
-        .replace(".", " ")
-        .replace("_", " ")
-        .strip()
-    )
-
-
 def infer_flavour_label(product_name: str) -> str:
     """Very simple label. You can expand keywords anytime."""
     if product_name is None:
@@ -303,10 +286,10 @@ def extract_pack_size_g(product_name):
     m = re.search(r'(\d+)\s*g\b', s.lower())
     if m:
         return float(m.group(1))
-    return np.nan
+    return np.nan 
 
 def infer_flavour_label(product_name, flavour_name=''):
-    s = norm_text(product_name) + ' ' + norm_text(flavour_name)
+
     buckets = [
         ('plain', ['plain', 'natural', 'greek']),
         ('vanilla', ['vanilla']),
@@ -321,18 +304,26 @@ def infer_flavour_label(product_name, flavour_name=''):
         ('granola', ['granola']),
         ('other', [])
     ]
-    for lab, kws in buckets:
-        if lab == 'other':
-            continue
-        if any(k in s for k in kws):
-            return lab
-    return 'other'
+
 def is_plain_yoghurt(product_name: str, flavour_label: str = "") -> bool:
-    s = norm_text(product_name) + " " + norm_text(flavour_label)
-    # plain/natural/greek treated as plain for washdown/changeover logic
-    return any(k in s for k in ["plain", "natural", "greek"]) and not any(
-        k in s for k in ["strawberry", "blueberry", "raspberry", "mango", "honey", "vanilla", "toffee", "granola", "choc", "tophat"]
-    )
+    s = norm_text(product_name)
+    f = norm_text(flavour_label)
+
+    # If flavour label is explicitly non-plain, it is not plain
+    if f and f not in ["plain", "natural", "greek"]:
+        return False
+
+    plain_keywords = ["plain", "natural", "greek"]
+    flav_keywords = [
+        "strawberry", "raspberry", "mango", "blueberry",
+        "honey", "vanilla", "toffee", "choc",
+        "granola", "berry"
+    ]
+
+    if any(k in s for k in flav_keywords):
+        return False
+
+    return any(k in s for k in plain_keywords)
 
 def assign_machine(product_name: str, pack_size_g: float):
     s = norm_text(product_name)
@@ -354,42 +345,8 @@ def assign_machine(product_name: str, pack_size_g: float):
         return "M1"
 
     return "UNKNOWN_LINE"
-
-def is_plain_yoghurt(product_name: str) -> bool:
-    if product_name is None:
-        return False
-    s = str(product_name).lower().replace(".", " ").replace("_", " ")
-
-    # plain styles (add more if your naming changes)
-    plain_keywords = ["plain", "natural", "greek"]
-
-    # anything that clearly indicates flavour
-    flav_keywords = ["strawberry", "raspberry", "mango", "blueberry", "honey", "vanilla", "toffee", "choc", "granola", "berry"]
-
-    if any(k in s for k in flav_keywords):
-        return False
-    return any(k in s for k in plain_keywords)
-def infer_flavour_label(product_name: str) -> str:
-    if product_name is None:
-        return "unknown"
-    s = str(product_name).lower().replace(".", " ").replace("_", " ")
-
-    if is_plain_yoghurt(product_name):
-        return "plain"
-
-    flavours = [
-        "vanilla", "honey", "toffee", "choc",
-        "strawberry", "raspberry", "mango", "blueberry", "berry",
-        "mandarin", "lime", "nectarine"
-    ]
-    for f in flavours:
-        if f in s:
-            return f
-
-    # fallback
-    return "flavoured"
-
 RISK_MAP = {
+
     'plain': 0,
     'vanilla': 1,
     'honey': 2,
