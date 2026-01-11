@@ -1,362 +1,269 @@
+# src/normalize.py
+from __future__ import annotations
+
 import re
-import pandas as pd
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
-
-#from risk_model import norm_text#
 import pandas as pd
 
-def norm_text(val) -> str:
-    if val is None or (isinstance(val, float) and pd.isna(val)):
+
+# -----------------------------
+# Text helpers
+# -----------------------------
+def norm_text(x: object) -> str:
+    """Lowercase, strip, collapse whitespace; safe for NaN/None."""
+    if x is None or (isinstance(x, float) and np.isnan(x)):
         return ""
-    return str(val).strip().lower().replace(".", " ").replace("_", " ")
+    s = str(x).strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
 
-def detect_product_column(df: pd.DataFrame) -> str | None:
+
+def _find_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     """
-    Try to find the column that contains product description/name.
-    Strong heuristic: column name contains 'product' and/or 'name' and/or 'description'.
+    Find a column whose normalized name matches any candidate exactly
+    or contains the candidate token.
     """
-    cols = list(df.columns)
-    low = {c: str(c).strip().lower() for c in cols}
+    norm_cols = {norm_text(c): c for c in df.columns}
 
-    # best matches first
-    priority = [
-        lambda s: ("product" in s and "name" in s),
-        lambda s: ("product" in s and "desc" in s),
-        lambda s: ("description" in s),
-        lambda s: ("product" in s),
-        lambda s: ("item" in s and "name" in s),
-        lambda s: ("item" in s),
-    ]
+    # exact match first
+    for cand in candidates:
+        c_norm = norm_text(cand)
+        if c_norm in norm_cols:
+            return norm_cols[c_norm]
 
-    for rule in priority:
-        for c in cols:
-            if rule(low[c]):
-                return c
-    return None
-
-def extract_pack_size_g(product_name: str):
-    """Returns pack size in grams if found, else None.
-    Handles 150g, 450g, 2kg, 5kg, 10kg.
-    """
-    mask_blank = df["product_name"].fillna("").astype(str).str.strip().eq("")
-    fallback_cols = []
-    for c in df.columns:
-      lc = c.lower()
-    if any(k in lc for k in ["code", "sku", "item", "desc", "description", "pack", "size", "variant", "flavour", "flavor"]):
-         fallback_cols.append(c)
-    if fallback_cols and mask_blank.any():
-    # Build a row-wise joined string safely
-        rebuilt = (
-    df.loc[mask_blank, fallback_cols]
-        .fillna("")
-        .astype(str)
-        .apply(lambda r: " ".join([x.strip() for x in r.tolist() if str(x).strip() != ""]), axis=1)
-    )
-    df.loc[mask_blank, "product_name"] = rebuilt
-    # Final cleanup and drop still-blank rows
-    df["product_name"] = df["product_name"].fillna("").astype(str).str.strip()
-    df = df[df["product_name"] != ""].copy()
-
-
-    if product_name is None:
-       return None
-    s = str(product_name).lower()
-
-    m_g = re.search(r"(\d+)\s*g\b", s)
-    if m_g:
-     return int(m_g.group(1))
-
-    m_kg = re.search(r"(\d+)\s*kg\b", s)
-    if m_kg:
-     return int(m_kg.group(1)) * 1000
+    # contains match
+    for cand in candidates:
+        token = norm_text(cand)
+        for nc, original in norm_cols.items():
+            if token and token in nc:
+                return original
 
     return None
 
-def is_granola(product_name: str) -> bool:
-    if product_name is None:
-        return False
-    return "granola" in str(product_name).lower()
-def infer_flavour_label(product_name: str) -> str:
-    """Very simple label. You can expand keywords anytime."""
-    if product_name is None:
-        return "unknown"
-    s = str(product_name).lower()
 
-    if is_plain_yoghurt(product_name):
-        return "plain"
+# -----------------------------
+# Product parsing
+# -----------------------------
+def extract_pack_size_g(product_name: str) -> float:
+    """
+    Returns pack size in grams if found (e.g., 150g, 450 g, 2kg, 10kg)
+    else NaN.
+    """
+    s = norm_text(product_name)
 
-    flavours = [
-        "strawberry","raspberry","mango","blueberry","honey","vanilla","toffee","choc","berry","mandarin","lime","nectarine"
-    ]
-    for f in flavours:
-        if f in s:
-            return f
-    return "flavoured"
-def assign_machine(row) -> str:
-    """Returns: M1, M2, M3, BUCKET, or UNKNOWN."""
-    product = row.get("product_name", "")
-    pack = row.get("pack_size_g")
-
-    # Bucket line: 2kg/5kg/10kg
-    if pack in (2000, 5000, 10000):
-        return "BUCKET"
-
-    # Granola always on M3
-    if row.get("is_granola", False):
-        return "M3"
-
-    # 450g always on M2
-    if pack == 450:
-        return "M2"
-
-    # M1 handles only 150g, 170g, 175g
-    if pack in (150, 170, 175):
-        # some 150g also run on M2 -> handle with an override list
-        return "M1"
-
-    return "UNKNOWN"
-M2_150G_OVERRIDES = [
-    # Put exact product name fragments here that run 150g on M2
-    # e.g. "C. Vanilla 150g", "SS Strawberry 150g"
-]
-
-def apply_m2_overrides(df: pd.DataFrame) -> pd.DataFrame:
-    if not M2_150G_OVERRIDES:
-        return df
-    mask_150 = df["pack_size_g"].eq(150)
-    mask_match = df["product_name"].astype(str).apply(
-        lambda x: any(k.lower() in x.lower() for k in M2_150G_OVERRIDES)
-    )
-    df.loc[mask_150 & mask_match, "machine"] = "M2"
-    return df
-
-def standardise_columns(df: pd.DataFrame) -> pd.DataFrame:
-    # strip spaces + lower for matching
-    cols = {c: c.strip() for c in df.columns}
-    df = df.rename(columns=cols)
-
-    # possible names in your real files
-    aliases = {
-        "product_name": ["product_name", "product", "product name", "Product name_Plan", "Product name", "Product"],
-        "batch_volume_l": ["batch_volume_l", "batch_volume", "base volume (l)", "Plan Base Volume (L)", "Base Volume (L)"],
-        "ph": ["ph", "pH", "PH"],
-    }
-
-    # build reverse lookup based on lowercase
-    lower_map = {c.lower(): c for c in df.columns}
-
-    for standard, options in aliases.items():
-        if standard in df.columns:
-            continue
-        for opt in options:
-            key = opt.lower()
-            if key in lower_map:
-                df = df.rename(columns={lower_map[key]: standard})
-                break
-    return df
-    df = standardise_columns(df)
-    required = ["product_name"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns: {missing}. Found columns: {list(df.columns)}")
-    # Clean headers
-    df.columns = [c.strip() for c in df.columns]
-    df["pack_size_g"] = df["product_name"].apply(extract_pack_size_g)
-    df["is_plain_yoghurt"] = df["product_name"].apply(is_plain_yoghurt)
-    df["flavour_label"] = df["product_name"].apply(infer_flavour_label)
-    df["is_granola"] = df["product_name"].apply(is_granola)
-    df["machine"] = df.apply(assign_machine, axis=1)
-    df = apply_m2_overrides(df)
-
-
-
-    # Helper: find a column by possible names
-    def pick_col(options):
-        opts = [o.strip().lower() for o in options]
-        for c in df.columns:
-            if c.strip().lower() in opts:
-                return c
-        return None
-
-    # --- Find real columns in your plan ---
-    product_col = pick_col(["product name", "product_name", "product", "product name " , "product name"])
-    vol_col = pick_col([
-        "plan base volume (l)", "base volume (l)", "base volume l",
-        "base volume", "volume (l)", "volume l", "plan volume (l)"
-    ])
-    ph_col = pick_col(["ph", "pH", "target ph", "target pH"])
-
-    # --- Rename to agent standard ---
-    rename_map = {}
-    if product_col: rename_map[product_col] = "product_name"
-    if vol_col: rename_map[vol_col] = "batch_volume_l"
-    if ph_col: rename_map[ph_col] = "ph"
-
-    df = df.rename(columns=rename_map)
-
-    # --- Required columns ---
-    if "product_name" not in df.columns:
-        raise ValueError(f"Missing product column. Available columns: {list(df.columns)}")
-
-    if "batch_volume_l" not in df.columns:
-        raise ValueError(f"Missing volume column. Available columns: {list(df.columns)}")
-
-    # --- Optional columns (create if missing) ---
-    if "ph" not in df.columns:
-        df["ph"] = pd.NA  # allow agent to run even if plan doesn't include pH
-
-    # Numeric conversions
-    df["batch_volume_l"] = pd.to_numeric(df["batch_volume_l"], errors="coerce")
-    df["ph"] = pd.to_numeric(df["ph"], errors="coerce")
-
-    return df
-def normalize_data(df: pd.DataFrame) -> pd.DataFrame:
-    df["is_plain_yoghurt"] = df.apply(
-    lambda r: is_plain_yoghurt(r.get("product_name", ""), r.get("flavour_label", "")),
-    axis=1
-)
-
-    df["machine"] = df.apply(
-    lambda r: assign_machine(r.get("product_name", ""), r.get("pack_size_g", None)),
-    axis=1
-)
-
-    # Clean headers
-    df.columns = [str(c).strip() for c in df.columns]
-
-    # --- Detect product column and create product_name ---
-    prod_col = detect_product_column(df)
-
-    if prod_col is not None:
-        df["product_name"] = df[prod_col].fillna("").astype(str).str.strip()
-    else:
-        # If no obvious product column, try to build from multiple likely columns
-        # (common in production plans)
-        possible_parts = []
-        for c in df.columns:
-            lc = c.lower()
-            if any(k in lc for k in ["product", "name", "desc", "flavour", "flavor", "variant", "size", "pack"]):
-                possible_parts.append(c)
-
-        if possible_parts:
-            df["product_name"] = (
-                df[possible_parts].fillna("").astype(str).agg(" ".join, axis=1).str.strip()
-            )
-        else:
-            df["product_name"] = ""
-
-    # Make sure it's not empty spaces
-    df["product_name"] = df["product_name"].fillna("").astype(str).str.strip()
-# Drop rows with empty product_name (prevents UNKNOWN PRODUCT spam)
-    df["product_name"] = df["product_name"].fillna("").astype(str).str.strip()
-    df = df[df["product_name"] != ""].copy()
-
-    # DEBUG (keep for now)
-    print("DEBUG product column detected:", prod_col)
-    print("DEBUG product_name sample:", df["product_name"].head(5).tolist())
-
-    # ... keep the rest of your normalize logic below ...
-
-
-    def norm_text(val):
-        if pd.isna(val):
-            return ''
-        return str(val).strip().lower()
-    return df
-    # Guarantee product_name exists (even if the input file uses other headings) if "product_name" not in df.columns:
-    # try common alternatives (case-insensitive)
-    lower_map = {c.lower(): c for c in df.columns}
-    for candidate in ["product", "product name", "product_name_plan", "product name_plan", "product name plan"]:
-        if candidate in lower_map:
-         df = df.rename(columns={lower_map[candidate]: "product_name"})
-        break
-# If still missing, create empty so downstream doesn't crash
-        if "product_name" not in df.columns:
-            df["product_name"] = ""
-
-    df["product_name"] = ""
-
-# Ensure it's filled and clean
-    df["product_name"] = df["product_name"].fillna("").astype(str).str.strip()
-
-def extract_pack_size_g(product_name):
-    if pd.isna(product_name):
-        return np.nan
-    s = str(product_name)
-    m = re.search(r'(\d+)\s*g\b', s.lower())
+    # grams: "150g" or "150 g"
+    m = re.search(r"(\d+(?:\.\d+)?)\s*g\b", s)
     if m:
         return float(m.group(1))
-    return np.nan 
 
-def infer_flavour_label(product_name, flavour_name=''):
+    # kilograms: "2kg" or "2 kg"
+    m = re.search(r"(\d+(?:\.\d+)?)\s*kg\b", s)
+    if m:
+        return float(m.group(1)) * 1000.0
 
-    buckets = [
-        ('plain', ['plain', 'natural', 'greek']),
-        ('vanilla', ['vanilla']),
-        ('honey', ['honey']),
-        ('strawberry', ['strawberry']),
-        ('blueberry', ['blueberry']),
-        ('raspberry', ['raspberry']),
-        ('mango', ['mango']),
-        ('apple_cinnamon', ['apple', 'cinamon', 'cinnamon']),
-        ('nectarine', ['nectarine']),
-        ('chocolate', ['choc', 'chocolate']),
-        ('granola', ['granola']),
-        ('other', [])
+    return float("nan")
+
+
+def infer_flavour_label(product_name: str, flavour_name: str = "") -> str:
+    """
+    Heuristic flavour detection from product_name/flavour_name.
+    Returns a simple label like: plain, vanilla, strawberry, blueberry, honey, raspberry, mango, etc.
+    """
+    s = f"{norm_text(product_name)} {norm_text(flavour_name)}"
+
+    buckets: List[Tuple[str, List[str]]] = [
+        ("plain", ["plain", "natural", "greek"]),
+        ("vanilla", ["vanilla"]),
+        ("honey", ["honey"]),
+        ("strawberry", ["strawberry"]),
+        ("blueberry", ["blueberry"]),
+        ("raspberry", ["raspberry"]),
+        ("mango", ["mango"]),
+        ("mandarin_lime", ["mandarin", "lime"]),
+        ("toffee", ["toffee"]),
+        ("apple_cinnamon", ["apple", "cinamon", "cinnamon"]),
+        ("white_choc", ["white choc", "whitechoc", "white chocolate"]),
+        ("granola", ["granola"]),
+        ("tophat", ["tophat"]),
     ]
+
+    for label, keys in buckets:
+        if all(k in s for k in keys):
+            return label
+
+    # fallback: unknown
+    return ""
+
 
 def is_plain_yoghurt(product_name: str, flavour_label: str = "") -> bool:
-    s = norm_text(product_name)
-    f = norm_text(flavour_label)
+    """
+    Plain yoghurt = natural/greek/plain AND not obviously flavoured.
+    """
+    s = f"{norm_text(product_name)} {norm_text(flavour_label)}"
+    is_plainish = any(k in s for k in ["plain", "natural", "greek"])
+    is_flavoured = any(
+        k in s
+        for k in [
+            "vanilla",
+            "strawberry",
+            "blueberry",
+            "raspberry",
+            "honey",
+            "mango",
+            "mandarin",
+            "lime",
+            "toffee",
+            "choc",
+            "granola",
+            "tophat",
+            "apple",
+            "cinamon",
+            "cinnamon",
+        ]
+    )
+    return bool(is_plainish and not is_flavoured)
 
-    # If flavour label is explicitly non-plain, it is not plain
-    if f and f not in ["plain", "natural", "greek"]:
-        return False
 
-    plain_keywords = ["plain", "natural", "greek"]
-    flav_keywords = [
-        "strawberry", "raspberry", "mango", "blueberry",
-        "honey", "vanilla", "toffee", "choc",
-        "granola", "berry"
-    ]
+# -----------------------------
+# Machine assignment rules (your factory rules)
+# -----------------------------
+def assign_machine_from_product(product_name: str, pack_size_g: float) -> str:
+    """
+    Your rules:
+    - All SS granola products -> M3 (flavour added on line)
+    - All granola products -> M3
+    - Buckets 2/5/10 kg -> BUCKET_LINE
+    - 450g pots -> M2 (and some 150g also run on M2)
+    - M1: 150g and 170/175g
+    - You have 3 machines + bucket line
 
-    if any(k in s for k in flav_keywords):
-        return False
+    Note: Since plan doesn't specify machines, we apply a best-effort default.
+    """
+    pn = norm_text(product_name)
 
-    return any(k in s for k in plain_keywords)
-
-def assign_machine(product_name: str, pack_size_g: float):
-    s = norm_text(product_name)
-
-    # Buckets line (2kg, 5kg, 10kg)
-    if pack_size_g in [2000, 5000, 10000] or "kg" in s:
+    # Buckets (2kg, 5kg, 10kg) => bucket line
+    if ("kg" in pn) or (not np.isnan(pack_size_g) and pack_size_g >= 2000):
         return "BUCKET_LINE"
 
-    # Granola always on M3
-    if "granola" in s:
+    # Granola lines (including SS granola)
+    if "granola" in pn:
         return "M3"
 
-    # 450g pots on M2
-    if pack_size_g == 450:
+    # 450g pots only on M2
+    if not np.isnan(pack_size_g) and 440 <= pack_size_g <= 460:
         return "M2"
 
-    # M1 does 150g / 170g / 175g
-    if pack_size_g in [150, 170, 175]:
+    # some 150g on M2; we need a rule. Use "c." or "crown" as default to M1 unless specified.
+    # If you later add explicit mapping, replace this section.
+    if not np.isnan(pack_size_g) and 145 <= pack_size_g <= 155:
+        # Default: M1, but allow specific items to go M2
+        # Example heuristics: "c.vanilla 450g" doesn't apply; for 150g, if it's a "C." core cup, keep M1.
         return "M1"
 
-    return "UNKNOWN_LINE"
-RISK_MAP = {
+    # 170/175g on M1
+    if not np.isnan(pack_size_g) and (165 <= pack_size_g <= 180):
+        return "M1"
 
-    'plain': 0,
-    'vanilla': 1,
-    'honey': 2,
-    'nectarine': 3,
-    'apple_cinnamon': 3,
-    'mango': 4,
-    'strawberry': 5,
-    'blueberry': 6,
-    'granola': 6,
-    'raspberry': 7,
-    'chocolate': 8,
-    'other': 5
-}
+    # fallback
+    return "M1"
+
+
+# -----------------------------
+# Column standardisation
+# -----------------------------
+def standardise_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Creates a consistent set of columns used by the rest of the pipeline.
+    Safe if columns are missing.
+    """
+    df = df.copy()
+
+    # Identify likely input columns
+    product_col = _find_column(df, ["product name", "product", "item", "description", "desc"])
+    pack_col = _find_column(df, ["pack size (g)", "pack size", "pack_size", "pack", "size (g)", "size"])
+    flavour_col = _find_column(df, ["flavour", "flavor", "flavour name", "flavor name"])
+    ph_col = _find_column(df, ["ph"])
+    batch_vol_col = _find_column(df, ["batch volume", "batch_volume", "total mix", "total mixed", "mix (kg)", "mix kg"])
+
+    # Build normalized columns
+    if product_col is not None:
+        df["product_name"] = df[product_col].astype(str)
+    else:
+        # hard fail: agent needs product names
+        raise ValueError(f"Missing product column. Available columns: {list(df.columns)}")
+
+    if pack_col is not None:
+        # try numeric; if it fails, we'll still parse from product_name later
+        df["pack_size_g"] = pd.to_numeric(df[pack_col], errors="coerce")
+    else:
+        df["pack_size_g"] = np.nan  # will be inferred from product_name
+
+    if flavour_col is not None:
+        df["flavour_name"] = df[flavour_col].astype(str)
+    else:
+        df["flavour_name"] = ""
+
+    # Optional numeric cols (agent can run without them)
+    if ph_col is not None:
+        df["ph"] = pd.to_numeric(df[ph_col], errors="coerce")
+    else:
+        df["ph"] = pd.NA
+
+    if batch_vol_col is not None:
+        # If mix is in kg, store it as batch_volume_kg; otherwise just keep numeric
+        df["batch_volume_kg"] = pd.to_numeric(df[batch_vol_col], errors="coerce")
+    else:
+        df["batch_volume_kg"] = pd.NA
+
+    return df
+
+
+# -----------------------------
+# Main normalize function
+# -----------------------------
+def normalize_data(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    End-to-end normalization:
+    - standardise key columns
+    - infer pack_size_g if missing
+    - infer flavour_label
+    - infer is_plain_yoghurt
+    - assign machine if missing
+    """
+    df = standardise_columns(df)
+
+    # Fill pack size from product_name where missing
+    # (only overwrite NaNs)
+    inferred_pack = df["product_name"].apply(lambda x: extract_pack_size_g(str(x)))
+    df["pack_size_g"] = df["pack_size_g"].where(~df["pack_size_g"].isna(), inferred_pack)
+
+    # flavour label
+    df["flavour_label"] = df.apply(
+        lambda r: infer_flavour_label(str(r.get("product_name", "")), str(r.get("flavour_name", ""))),
+        axis=1,
+    )
+
+    # plain yoghurt flag
+    df["is_plain_yoghurt"] = df.apply(
+        lambda r: is_plain_yoghurt(str(r.get("product_name", "")), str(r.get("flavour_label", ""))),
+        axis=1,
+    )
+
+    # machine assignment (only if machine column doesn't exist or is empty)
+    if "machine" not in df.columns:
+        df["machine"] = df.apply(
+            lambda r: assign_machine_from_product(str(r.get("product_name", "")), float(r.get("pack_size_g", np.nan))),
+            axis=1,
+        )
+    else:
+        # fill blanks only
+        df["machine"] = df["machine"].astype(str)
+        mask_blank = df["machine"].str.strip().eq("") | df["machine"].str.lower().eq("nan")
+        df.loc[mask_blank, "machine"] = df.loc[mask_blank].apply(
+            lambda r: assign_machine_from_product(str(r.get("product_name", "")), float(r.get("pack_size_g", np.nan))),
+            axis=1,
+        )
+
+    return df

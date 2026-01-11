@@ -1,17 +1,17 @@
+from pathlib import Path
 import pandas as pd
 
-def load_daily_plan(path):
-    df = pd.read_csv(path)
-    df.columns = [str(c).strip() for c in df.columns]
-    if ' Date' in df.columns and 'Date' not in df.columns:
-        df = df.rename(columns={' Date': 'Date'})
-    return df
+DATA_DIR = Path("data/input")
+DEFAULT_FILE = DATA_DIR / "Prod_Plan_Today.csv"
 
-def load_form_responses(path):
-    df = pd.read_csv(path)
-    df.columns = [str(c).strip() for c in df.columns]
-    if 'Total Volume (kg)' not in df.columns:
-        for c in list(df.columns):
-            if c.replace(' ', '') == 'TotalVolume(kg)':
-                df = df.rename(columns={c: 'Total Volume (kg)'})
-    return df
+def load_input_csv(path: str | None = None) -> pd.DataFrame:
+    """
+    Load production plan CSV.
+    If path is None, loads default daily plan.
+    """
+    csv_path = Path(path) if path else DEFAULT_FILE
+
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Input CSV not found: {csv_path.resolve()}")
+
+    return pd.read_csv(csv_path)
