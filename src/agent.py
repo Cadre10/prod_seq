@@ -10,7 +10,7 @@ import pandas as pd
 from src.io_data import load_input_csv
 from src.normalize import normalize_data
 from src.risk_model import score_risk
-
+from src.sequencer import propose_sequence, sequence_actions
 # Optional: if you have src/sequencer.py with sequence_actions(df) -> list[str] or Series[str]
 try:
     from src.sequencer import sequence_actions  # type: ignore
@@ -210,6 +210,15 @@ def main() -> None:
     # 4) Risk scoring
     df["risk_final"] = score_risk(df)
     print("⚠️ Risk scored")
+
+# Proposed optimal sequence per machine
+    seq = propose_sequence(df)
+
+# Create actions on the sequenced table
+    seq["action"] = sequence_actions(seq)
+
+# Save/print using seq instead of df
+    df_out = seq.copy()
 
     # 5) Changeover + washdown logic
     df = add_changeover_and_washdown(df)

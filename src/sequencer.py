@@ -1,216 +1,260 @@
 # src/sequencer.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
 import pandas as pd
-from typing import Tuple, List
-import pandas as pd
 
-def compress_runs(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
 
-    # Use original order if no explicit order column exists
-    if "plan_order" not in df.columns:
-        df["plan_order"] = range(len(df))
+# -----------------------------
+# CONFIG (tune these)
+# -----------------------------
+@dataclass
+class ChangeoverConfig:
+    # time weights (minutes) – tune to your factory
+    BASE_PRODUCT_CHANGE_MIN: float = 10.0
+    FLAVOUR_CHANGE_EXTRA_MIN: float = 12.0
+    PLAIN_TO_FLAVOURED_EXTRA_MIN: float = 8.0
+    GRANOLA_CHANGE_EXTRA_MIN: float = 15.0
 
-    keys = ["machine", "product_name", "pack_size_g", "flavour_label"]
+    # washdown “hard” time adders (minutes)
+    WASHDOWN_MIN: float = 25.0
+    FULL_WASHDOWN_MIN: float = 45.0
 
-    df = df.sort_values(["machine", "plan_order"], na_position="last").copy()
+    # policy: if true, any granola product change on M3 requires washdown
+    M3_ALWAYS_WASHDOWN_ON_PRODUCT_CHANGE: bool = True
 
-    # New run whenever any key changes
-    change = (df[keys] != df[keys].shift()).any(axis=1)
-    df["_run_id"] = change.cumsum()
 
-    # Aggregate quantities if present
-    qty_cols = [c for c in ["Packed no/trays", "Packed yogh (kg)", "Plan Total mixd yog (kg)"] if c in df.columns]
+CFG = ChangeoverConfig()
 
-    agg = {
-        "machine": "first",
-        "product_name": "first",
-        "pack_size_g": "first",
-        "flavour_label": "first",
-        "is_plain_yoghurt": "first",
 
-        # worst-case flags inside the run
-        "risk_final": "max",
-        "risk_reason": "first",
-        "changeover_required": "max",
-        "changeover_reason": "first",
-        "washdown_required": "max",
-        "washdown_reason": "first",
-        "action": "first",
-        "plan_order": "first",
+# -----------------------------
+# Helpers (features)
+# -----------------------------
+def _s(x) -> str:
+    return "" if x is None else str(x)
+
+def is_granola(product_name: str) -> bool:
+    return "granola" in _s(product_name).lower() or _s(product_name).lower().startswith("ss ")
+
+def has_chocolate(product_name: str, flavour_label: str = "") -> bool:
+    t = (_s(product_name) + " " + _s(flavour_label)).lower()
+    return ("choc" in t) or ("chocolate" in t)
+
+def has_nuts_granola_risk(product_name: str, flavour_label: str = "") -> bool:
+    # Adjust to your allergen reality (granola often implies cereals/nuts)
+    t = (_s(product_name) + " " + _s(flavour_label)).lower()
+    return ("granola" in t) or ("nut" in t) or ("almond" in t) or ("hazelnut" in t)
+
+def flavour_bucket(flavour_label: str) -> str:
+    # light normalization so “mango granola” and “mango” align
+    f = _s(flavour_label).strip().lower()
+    return f
+
+def make_features(row: pd.Series) -> Dict[str, object]:
+    pn = _s(row.get("product_name", ""))
+    fl = _s(row.get("flavour_label", ""))
+    return {
+        "product_name": pn,
+        "flavour": flavour_bucket(fl),
+        "is_plain": bool(row.get("is_plain_yoghurt", False)),
+        "is_granola": is_granola(pn),
+        "has_choc": has_chocolate(pn, fl),
+        "has_nut_risk": has_nuts_granola_risk(pn, fl),
+        "pack": row.get("pack_size_g", np.nan),
+        "machine": _s(row.get("machine", "")),
     }
 
-    for c in qty_cols:
-        agg[c] = "sum"
 
-    out = df.groupby("_run_id", as_index=False).agg(agg)
-    out = out.sort_values(["machine", "plan_order"], na_position="last")
-    return out.drop(columns=["plan_order"])
+# -----------------------------
+# Transition rules
+# -----------------------------
+def transition_cost(a: Dict[str, object], b: Dict[str, object], cfg: ChangeoverConfig) -> Tuple[float, bool, str]:
+    """
+    Returns (cost_minutes, washdown_required, reason)
+    """
+    if a["machine"] != b["machine"]:
+        # we never transition across machines in sequencing; treat as huge cost
+        return 1e9, True, "Different machine"
 
-print("✅ sequencer.py LOADED")
-def needs_washdown(prev_row, curr_row) -> Tuple[bool, str]:
-    """A + B rules + SS granola nuance."""
-    prev_flav = str(prev_row.get("flavour_label", "unknown"))
-    curr_flav = str(curr_row.get("flavour_label", "unknown"))
+    cost = 0.0
+    reasons: List[str] = []
+    washdown = False
 
-    prev_plain = bool(prev_row.get("is_plain_yoghurt", False))
-    curr_plain = bool(curr_row.get("is_plain_yoghurt", False))
+    # Product change base
+    if a["product_name"] != b["product_name"]:
+        cost += cfg.BASE_PRODUCT_CHANGE_MIN
+        reasons.append("product change")
 
-    # A) flavoured -> plain
-    if (prev_plain is False) and (curr_plain is True):
-        return True, f"Washdown: flavoured → plain ({prev_flav} → plain)"
+    # Granola rule (M3)
+    if a["machine"] == "M3" and cfg.M3_ALWAYS_WASHDOWN_ON_PRODUCT_CHANGE:
+        if a["product_name"] != b["product_name"]:
+            washdown = True
+            cost += cfg.WASHDOWN_MIN
+            reasons.append("M3 granola washdown")
 
-    # B) any flavour change (including plain->flavoured and flavoured->flavoured)
-    if prev_flav != curr_flav:
-        # SS granola nuance: flavour is dosed on-line
-        if bool(curr_row.get("is_granola", False)) or bool(prev_row.get("is_granola", False)):
-            return True, f"Washdown/flush + verify doser: granola flavour change ({prev_flav} → {curr_flav})"
-        return True, f"Washdown: flavour change ({prev_flav} → {curr_flav})"
+    # Flavour change
+    if a["flavour"] and b["flavour"] and a["flavour"] != b["flavour"]:
+        cost += cfg.FLAVOUR_CHANGE_EXTRA_MIN
+        washdown = True
+        reasons.append(f"flavour change {a['flavour']}→{b['flavour']}")
 
-    return False, ""
-def sequence_actions(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
-    """Returns list of action strings and adds changeover/washdown columns to df."""
-    actions = []
-    changeover_required = []
-    changeover_reason = []
-    washdown_required = []
-    washdown_reason = []
+    # Plain ↔ flavoured
+    if bool(a["is_plain"]) != bool(b["is_plain"]):
+        cost += cfg.PLAIN_TO_FLAVOURED_EXTRA_MIN
+        washdown = True
+        reasons.append("plain↔flavoured switch")
 
-    # Sort by machine first (since they run separately), then risk
-    df_sorted = df.copy()
-    if "risk_final" in df_sorted.columns:
-        df_sorted = df_sorted.sort_values(by=["machine", "risk_final"], ascending=[True, False])
-    else:
-        df_sorted = df_sorted.sort_values(by=["machine"])
+    # Granola ↔ non-granola
+    if bool(a["is_granola"]) != bool(b["is_granola"]):
+        cost += cfg.GRANOLA_CHANGE_EXTRA_MIN
+        washdown = True
+        reasons.append("granola↔non-granola")
 
-    prev_by_machine = {}
+    # “Harder” washdown triggers (tune to your HACCP/allergen reality)
+    # Example: nut/choc risk transitions → full washdown
+    if bool(a["has_nut_risk"]) != bool(b["has_nut_risk"]):
+        washdown = True
+        cost += (cfg.FULL_WASHDOWN_MIN - cfg.WASHDOWN_MIN)
+        reasons.append("allergen risk shift (full washdown)")
 
-    for idx, row in df_sorted.iterrows():
-        product = row.get("product_name", "UNKNOWN PRODUCT")
-        machine = row.get("machine", "UNKNOWN")
-        risk = row.get("risk_final", 0)
+    if bool(a["has_choc"]) != bool(b["has_choc"]):
+        washdown = True
+        cost += (cfg.FULL_WASHDOWN_MIN - cfg.WASHDOWN_MIN)
+        reasons.append("choc/non-choc shift (full washdown)")
 
-        # ---- Your action rules (keep simple) ----
-        if risk >= 5:
-            action = f"🚨 STOP LINE ({machine}): {product}"
-        elif risk >= 4:
-            action = f"⚠️ HOLD BATCH ({machine}): {product}"
-        elif risk >= 3:
-            action = f"🔍 INCREASE MONITORING ({machine}): {product}"
+    return cost, washdown, "; ".join(reasons) if reasons else "no change"
+
+
+# -----------------------------
+# Sequencing algorithm (greedy)
+# -----------------------------
+def build_sequence_for_machine(df_m: pd.DataFrame, cfg: ChangeoverConfig) -> pd.DataFrame:
+    """
+    Returns df_m with a proposed order (sequence_rank) and transition notes.
+    Greedy approach:
+      - choose a smart start (plain/low-risk)
+      - repeatedly pick the next product with minimal transition cost
+    """
+    df_m = df_m.copy().reset_index(drop=True)
+
+    # Create one “job” per distinct product run candidate
+    # If your plan has duplicates, collapse to unique SKUs for sequencing:
+    keys = ["product_name", "flavour_label", "pack_size_g", "machine"]
+    df_jobs = df_m.drop_duplicates(subset=[k for k in keys if k in df_m.columns]).copy().reset_index(drop=True)
+
+    if len(df_jobs) <= 1:
+        df_jobs["sequence_rank"] = range(1, len(df_jobs) + 1)
+        df_jobs["washdown_required"] = False
+        df_jobs["washdown_reason"] = ""
+        df_jobs["changeover_required"] = False
+        df_jobs["changeover_reason"] = ""
+        return df_jobs
+
+    # Precompute features
+    feats = [make_features(df_jobs.loc[i]) for i in range(len(df_jobs))]
+
+    # Choose start:
+    # Prefer plain + non-granola + no nut risk + no choc (lowest cleaning burden)
+    def start_score(f: Dict[str, object]) -> float:
+        s = 0.0
+        if f["is_plain"]: s -= 5.0
+        if not f["is_granola"]: s -= 2.0
+        if not f["has_nut_risk"]: s -= 2.0
+        if not f["has_choc"]: s -= 1.0
+        return s
+
+    start_idx = min(range(len(feats)), key=lambda i: start_score(feats[i]))
+
+    remaining = set(range(len(feats)))
+    order: List[int] = []
+    order.append(start_idx)
+    remaining.remove(start_idx)
+
+    # Greedy next
+    while remaining:
+        last = order[-1]
+        best_i = None
+        best_cost = 1e18
+        best_wash = False
+        best_reason = ""
+
+        for j in remaining:
+            c, w, r = transition_cost(feats[last], feats[j], cfg)
+            if c < best_cost:
+                best_cost = c
+                best_i = j
+                best_wash = w
+                best_reason = r
+
+        order.append(best_i)  # type: ignore
+        remaining.remove(best_i)  # type: ignore
+
+    # Build transition columns
+    seq_rows = df_jobs.loc[order].copy().reset_index(drop=True)
+    seq_rows["sequence_rank"] = range(1, len(seq_rows) + 1)
+
+    wash_flags = [False]
+    wash_reasons = [""]
+    chg_flags = [False]
+    chg_reasons = ["START"]
+
+    for i in range(1, len(seq_rows)):
+        a = make_features(seq_rows.loc[i - 1])
+        b = make_features(seq_rows.loc[i])
+        c, w, r = transition_cost(a, b, cfg)
+
+        prod_change = a["product_name"] != b["product_name"]
+        chg_flags.append(bool(prod_change))
+        chg_reasons.append(r if prod_change else "no product change")
+
+        wash_flags.append(bool(w))
+        wash_reasons.append(r if w else "")
+
+    seq_rows["changeover_required"] = chg_flags
+    seq_rows["changeover_reason"] = chg_reasons
+    seq_rows["washdown_required"] = wash_flags
+    seq_rows["washdown_reason"] = wash_reasons
+
+    return seq_rows
+
+
+def propose_sequence(df: pd.DataFrame, cfg: ChangeoverConfig = CFG) -> pd.DataFrame:
+    """
+    Returns a proposed sequence per machine.
+    Output includes:
+      - sequence_rank
+      - washdown_required / reason
+      - changeover_required / reason
+    """
+    if "machine" not in df.columns:
+        raise ValueError("propose_sequence requires a 'machine' column (auto-assign it in normalize.py)")
+
+    out_parts = []
+    for m, df_m in df.groupby("machine", dropna=False):
+        df_m = df_m.copy()
+        df_m["machine"] = str(m)
+        out_parts.append(build_sequence_for_machine(df_m, cfg))
+
+    return pd.concat(out_parts, ignore_index=True)
+
+
+# -----------------------------
+# Actions for the agent
+# -----------------------------
+def sequence_actions(df: pd.DataFrame) -> List[str]:
+    """
+    Creates a simple action label for each row (in the proposed sequence table).
+    """
+    actions: List[str] = []
+    for _, r in df.iterrows():
+        if bool(r.get("washdown_required", False)):
+            actions.append("WASHDOWN + RUN")
+        elif bool(r.get("changeover_required", False)):
+            actions.append("CHANGEOVER + RUN")
         else:
-            action = f"✅ RELEASE ({machine}): {product}"
-
-        # ---- Changeover/Washdown logic per machine ----
-        prev = prev_by_machine.get(machine)
-
-        co = False
-        co_reason = ""
-        wd = False
-        wd_reason = ""
-
-        if prev is not None:
-            prev_product = prev.get("product_name", "")
-            if str(prev_product) != str(product):
-                co = True
-                co_reason = f"Changeover on {machine}: '{prev_product}' → '{product}'"
-
-                wd, wd_reason = needs_washdown(prev, row)
-
-        changeover_required.append(co)
-        changeover_reason.append(co_reason)
-        washdown_required.append(wd)
-        washdown_reason.append(wd_reason)
-
-        actions.append(action)
-        prev_by_machine[machine] = row
-
-    # Write back to df in the original row order
-    # (We created lists in df_sorted order, so we assign using df_sorted index)
-    df.loc[df_sorted.index, "changeover_required"] = changeover_required
-    df.loc[df_sorted.index, "changeover_reason"] = changeover_reason
-    df.loc[df_sorted.index, "washdown_required"] = washdown_required
-    df.loc[df_sorted.index, "washdown_reason"] = washdown_reason
-
+            actions.append("RUN")
     return actions
 
-def sequence_actions(df: pd.DataFrame):
-    """
-    Convert risk scores into ordered operator actions
-    """
-    actions = []
-
-    for _, row in df.iterrows():
-        risk = row.get("risk_final", 0)
-        product = (row.get("product_" \
-    "name") or "").strip() or "UNKNOWN PRODUCT"
-
-        if risk >= 5:
-            actions.append(
-                f"🚨 STOP LINE: {product} – Critical risk detected"
-            )
-        elif risk == 4:
-            actions.append(
-                f"⚠️ HOLD BATCH: {product} – QA review required"
-            )
-        elif risk == 3:
-            actions.append(
-                f"🔍 INCREASE MONITORING: {product}"
-            )
-        else:
-            actions.append(
-                f"✅ RELEASE: {product}"
-            )
-
-    return actions
-
-def add_changeover_and_washdown(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    df["changeover_required"] = False
-    df["changeover_reason"] = ""
-    df["washdown_required"] = False
-    df["washdown_reason"] = ""
-
-    # sort by machine, keep plan order if you have a "seq" column; else keep as-is
-    if "machine" in df.columns:
-        df = df.sort_values(["machine"], na_position="last")
-
-    prev = {}  # machine -> previous row info
-
-    for i, row in df.iterrows():
-        m = str(row.get("machine", "") or "")
-        prod = str(row.get("product_name", "") or "")
-        flav = str(row.get("flavour_label", "") or "")
-        is_plain = bool(row.get("is_plain_yoghurt", False))
-
-        if not m:
-            continue
-
-        if m in prev:
-            pprod, pflav, pplain = prev[m]
-
-            # Changeover when product changes
-            if prod and pprod and prod != pprod:
-                df.at[i, "changeover_required"] = True
-                df.at[i, "changeover_reason"] = f"Product change on {m}: {pprod} → {prod}"
-
-            # Washdown rules
-            # Rule A: Granola line (M3): washdown when changing products
-            if m == "M3" and prod and pprod and prod != pprod:
-                df.at[i, "washdown_required"] = True
-                df.at[i, "washdown_reason"] = f"M3 granola line: washdown required for product change"
-
-            # Rule B: plain ↔ flavoured change
-            if pplain != is_plain:
-                df.at[i, "washdown_required"] = True
-                reason = "Plain ↔ flavoured switch"
-                df.at[i, "washdown_reason"] = (df.at[i, "washdown_reason"] + " | " + reason).strip(" |")
-
-            # Rule C: flavour label changed (non-empty)
-            if pflav and flav and pflav != flav:
-                df.at[i, "washdown_required"] = True
-                reason = f"Flavour change: {pflav} → {flav}"
-                df.at[i, "washdown_reason"] = (df.at[i, "washdown_reason"] + " | " + reason).strip(" |")
-
-        prev[m] = (prod, flav, is_plain)
-
-    return df
