@@ -1,278 +1,207 @@
-# dashboard.py
-from __future__ import annotations
-
 import os
-from pathlib import Path
-from datetime import datetime
-
+import glob
 import pandas as pd
 import streamlit as st
 
-# --- Import your pipeline code ---
-# These must exist in your project:
-# src/normalize.py -> normalize_data(df)
-# src/risk_model.py -> score_risk(df)
-try:
-    from src.normalize import normalize_data
-    from src.risk_model import score_risk
-except Exception as e:
-    st.error(f"Failed to import your src modules: {e}")
-    st.stop()
+st.set_page_config(page_title="Yoghurt AI Agent Dashboard", layout="wide")
 
+st.title("🧠 Yoghurt AI Agent Dashboard")
+st.caption("Shows sequenced plan + washdown/changeover + risks (auto machine assignment supported).")
 
-# =========================
-# CONFIG
-# =========================
-DEFAULT_INPUT = Path("data/input/Prod_Plan_Today.csv")
-OUTPUT_DIR = Path("Outputs")
-OUTPUT_DIR.mkdir(exist_ok=True)
+# ----------------------------
+# Helpers
+# ----------------------------
+def find_latest_output(pattern="Outputs/agent_decisions_*.csv"):
+    files = glob.glob(pattern)
+    if not files:
+        return None
+    files.sort(key=os.path.getmtime, reverse=True)
+    return files[0]
 
+def safe_bool_series(s):
+    # converts True/False, "TRUE"/"FALSE", 1/0, blanks → False
+    if s is None:
+        return None
+    if s.dtype == bool:
+        return s.fillna(False)
+    return s.fillna(False).astype(str).str.strip().str.lower().isin(["true", "1", "yes", "y"])
 
-# =========================
-# MACHINE ASSIGNMENT RULES
-# =========================
-M2_150_OVERRIDES = {
-    # Put exact product names here if some 150g runs on M2
-    # Example:
-    # "C.SomeProduct 150g",
-}
-
-def assign_machine(row: pd.Series) -> str:
-    pn = str(row.get("product_name", "") or "")
-    pn_l = pn.lower()
-    pack = row.get("pack_size_g", None)
-
-    # override
-    if pn in M2_150_OVERRIDES:
-        return "M2"
-
-    # Buckets line
-    if any(x in pn_l for x in ["2kg", "5kg", "10kg"]) or pack in [2000, 5000, 10000]:
-        return "BUCKET_LINE"
-
-    # Granola line (M3)
-    # - all granola products
-    # - all SS granola
-    if "granola" in pn_l or pn_l.startswith("ss "):
-        return "M3"
-
-    # 450g pots -> M2
-    if pack == 450 or "450g" in pn_l:
-        return "M2"
-
-    # M1: 150g, 170g, 175g (default)
-    if pack in [150, 170, 175] or any(x in pn_l for x in ["150g", "170g", "175g"]):
-        return "M1"
-
-    return "M1"
-
-
-# =========================
-# CHANGEOVER + WASHDOWN
-# =========================
-def add_changeover_and_washdown(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    for c in ["changeover_required", "washdown_required"]:
+def ensure_cols(df):
+    # Create missing columns so dashboard never breaks
+    defaults = {
+        "machine": "",
+        "sequence": None,
+        "product_name": "",
+        "pack_size_g": None,
+        "flavour_label": "",
+        "is_plain_yoghurt": False,
+        "risk_final": "",
+        "risk_reason": "",
+        "changeover_required": False,
+        "changeover_reason": "",
+        "washdown_required": False,
+        "washdown_reason": "",
+        "action": "",
+    }
+    for c, v in defaults.items():
         if c not in df.columns:
-            df[c] = False
-    for c in ["changeover_reason", "washdown_reason"]:
-        if c not in df.columns:
-            df[c] = ""
+            df[c] = v
 
-    # Sort by machine first (sequence logic is per-machine).
-    # If you later add a "sequence" column, include it here.
-    if "machine" in df.columns:
-        df = df.sort_values(["machine"], na_position="last").reset_index(drop=True)
+    # normalize booleans
+    df["washdown_required"] = safe_bool_series(df["washdown_required"])
+    df["changeover_required"] = safe_bool_series(df["changeover_required"])
+    df["is_plain_yoghurt"] = safe_bool_series(df["is_plain_yoghurt"])
 
-    prev = {}  # machine -> (product, flavour, is_plain)
+    # clean strings
+    for c in ["machine", "product_name", "flavour_label", "risk_final", "risk_reason",
+              "changeover_reason", "washdown_reason", "action"]:
+        df[c] = df[c].fillna("").astype(str)
 
-    for i, row in df.iterrows():
-        m = str(row.get("machine", "") or "")
-        prod = str(row.get("product_name", "") or "")
-        flav = str(row.get("flavour_label", "") or "")
-        is_plain = bool(row.get("is_plain_yoghurt", False))
-
-        if not m:
-            continue
-
-        if m in prev:
-            pprod, pflav, pplain = prev[m]
-
-            # Changeover if product changed
-            if prod and pprod and prod != pprod:
-                df.at[i, "changeover_required"] = True
-                df.at[i, "changeover_reason"] = f"Product change on {m}: {pprod} → {prod}"
-
-            # Washdown rules:
-            # A) M3 (granola line): washdown required when changing products
-            if m == "M3" and prod and pprod and prod != pprod:
-                df.at[i, "washdown_required"] = True
-                df.at[i, "washdown_reason"] = "M3 granola line: washdown required for product change"
-
-            # B) Plain ↔ flavoured switch
-            if pplain != is_plain:
-                df.at[i, "washdown_required"] = True
-                reason = "Plain ↔ flavoured switch"
-                df.at[i, "washdown_reason"] = (str(df.at[i, "washdown_reason"]) + " | " + reason).strip(" |")
-
-            # C) Flavour label change (if both are non-empty)
-            if pflav and flav and pflav != flav:
-                df.at[i, "washdown_required"] = True
-                reason = f"Flavour change: {pflav} → {flav}"
-                df.at[i, "washdown_reason"] = (str(df.at[i, "washdown_reason"]) + " | " + reason).strip(" |")
-
-        prev[m] = (prod, flav, is_plain)
+    # numeric
+    for c in ["pack_size_g", "sequence"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
     return df
 
+def compute_summary(df):
+    total = len(df)
+    wash = int(df["washdown_required"].sum())
+    chg = int(df["changeover_required"].sum())
+    high_risk = int((df["risk_final"].str.lower().isin(["high", "critical"])).sum())
+    unknown_machine = int((df["machine"].str.strip() == "").sum())
 
-# =========================
-# HELPERS
-# =========================
-def load_csv(path: Path) -> pd.DataFrame:
-    if not path.exists():
-        raise FileNotFoundError(f"Input file not found: {path}")
-    return pd.read_csv(path)
+    return {
+        "Total rows": total,
+        "Washdowns": wash,
+        "Changeovers": chg,
+        "High/Critical risk": high_risk,
+        "Missing machine": unknown_machine
+    }
 
-def run_pipeline(df: pd.DataFrame) -> pd.DataFrame:
-    df = normalize_data(df)
+# ----------------------------
+# Load Data
+# ----------------------------
+with st.sidebar:
+    st.header("📥 Data source")
 
-    # Ensure product_name exists
-    if "product_name" not in df.columns:
-        raise ValueError(f"normalize_data did not create product_name. Columns: {list(df.columns)}")
+    latest = find_latest_output()
+    st.write("**Latest output found:**")
+    st.code(latest if latest else "None found in Outputs/")
 
-    # Auto-assign machine if missing or blank
-    if "machine" not in df.columns:
-        df["machine"] = ""
-    df["machine"] = df["machine"].fillna("").astype(str)
-    mask_blank_machine = df["machine"].str.strip().eq("")
-    if mask_blank_machine.any():
-        df.loc[mask_blank_machine, "machine"] = df.loc[mask_blank_machine].apply(assign_machine, axis=1)
+    uploaded = st.file_uploader("Upload a CSV (optional)", type=["csv"])
 
-    # Risk score
-    df["risk_final"] = score_risk(df)
+    use_latest = st.checkbox("Use latest Outputs/agent_decisions_*.csv", value=True)
 
-    # Washdown/changeover
-    df = add_changeover_and_washdown(df)
+    if uploaded is None and not use_latest:
+        st.warning("Choose latest output or upload a CSV.")
+        st.stop()
 
-    # Basic action column (if you already have src.sequencer, you can replace this)
-    if "action" not in df.columns:
-        # Example simple action from risk:
-        df["action"] = df["risk_final"].astype(str).apply(lambda x: "HOLD / CHECK" if "HIGH" in x.upper() else "RELEASE")
-
-    return df
-
-
-# =========================
-# STREAMLIT UI
-# =========================
-st.set_page_config(page_title="Yoghurt QA Agent Dashboard", layout="wide")
-
-st.title("🧠 Yoghurt QA Agent Dashboard")
-st.caption("Upload / load plan → normalize → risk score → machine assignment → washdown/changeover decisions")
-
-# Sidebar inputs
-st.sidebar.header("Inputs")
-
-use_upload = st.sidebar.checkbox("Upload plan CSV instead of using default")
-uploaded = None
-if use_upload:
-    uploaded = st.sidebar.file_uploader("Upload production plan CSV", type=["csv"])
-
-default_path = st.sidebar.text_input("Default input path", str(DEFAULT_INPUT))
-default_path = Path(default_path)
-
-run_btn = st.sidebar.button("▶ Run Agent")
-
-# Filters
-st.sidebar.divider()
-st.sidebar.header("Filters")
-
-only_washdown = st.sidebar.checkbox("Show only washdown required")
-only_changeover = st.sidebar.checkbox("Show only changeover required")
-search_text = st.sidebar.text_input("Search product name contains", "")
-
-# Main
-if run_btn:
-    try:
-        if uploaded is not None:
-            df_in = pd.read_csv(uploaded)
-            st.success("✅ Loaded uploaded CSV")
-        else:
-            df_in = load_csv(default_path)
-            st.success(f"✅ Loaded default CSV: {default_path}")
-
-        df = run_pipeline(df_in)
-
-        # Apply filters
-        view = df.copy()
-
-        if "machine" in view.columns:
-            machines = sorted([m for m in view["machine"].dropna().unique().tolist() if str(m).strip() != ""])
-            chosen_machines = st.sidebar.multiselect("Machines", machines, default=machines)
-            if chosen_machines:
-                view = view[view["machine"].isin(chosen_machines)]
-
-        if only_washdown and "washdown_required" in view.columns:
-            view = view[view["washdown_required"] == True]
-
-        if only_changeover and "changeover_required" in view.columns:
-            view = view[view["changeover_required"] == True]
-
-        if search_text.strip():
-            s = search_text.strip().lower()
-            view = view[view["product_name"].astype(str).str.lower().str.contains(s, na=False)]
-
-        # Summary
-        st.subheader("📌 Summary by machine")
-        if "machine" in view.columns:
-            summary = view.groupby("machine", dropna=False).agg(
-                runs=("product_name", "count"),
-                washdowns=("washdown_required", "sum"),
-                changeovers=("changeover_required", "sum"),
-            ).reset_index()
-            st.dataframe(summary, use_container_width=True)
-        else:
-            st.info("No machine column found.")
-
-        # Table
-        st.subheader("📋 Decisions table")
-
-        SHOW_COLS = [
-            "machine",
-            "product_name",
-            "pack_size_g",
-            "flavour_label",
-            "is_plain_yoghurt",
-            "risk_final",
-            "risk_reason",
-            "changeover_required",
-            "changeover_reason",
-            "washdown_required",
-            "washdown_reason",
-            "action",
-        ]
-        cols = [c for c in SHOW_COLS if c in view.columns]
-        st.dataframe(view[cols], use_container_width=True)
-
-        # Save + Download
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = OUTPUT_DIR / f"agent_decisions_{ts}.csv"
-        view[cols].to_csv(out_path, index=False)
-
-        st.success(f"✅ Saved decisions to: {out_path}")
-
-        st.download_button(
-            "⬇ Download decisions CSV",
-            data=view[cols].to_csv(index=False).encode("utf-8"),
-            file_name=out_path.name,
-            mime="text/csv",
-        )
-
-    except Exception as e:
-        st.error(f"❌ Error: {e}")
+if uploaded is not None:
+    df = pd.read_csv(uploaded)
 else:
-    st.info("Click **Run Agent** in the sidebar to generate today's decisions.")
-    st.write("Expected default input file:")
-    st.code(str(DEFAULT_INPUT))
+    if latest is None:
+        st.error("No Outputs/agent_decisions_*.csv found. Run: python -m src.agent")
+        st.stop()
+    df = pd.read_csv(latest)
+
+df = ensure_cols(df)
+
+# ----------------------------
+# Filters
+# ----------------------------
+with st.sidebar:
+    st.header("🔎 Filters")
+
+    machines = sorted([m for m in df["machine"].unique() if str(m).strip() != ""])
+    machine_sel = st.multiselect("Machine", machines, default=machines)
+
+    show_only_wash = st.checkbox("Only rows requiring washdown", value=False)
+    show_only_chg = st.checkbox("Only rows requiring changeover", value=False)
+
+    risk_vals = sorted([r for r in df["risk_final"].unique() if r.strip() != ""])
+    risk_sel = st.multiselect("Risk level", risk_vals, default=risk_vals)
+
+view = df.copy()
+
+if machine_sel:
+    view = view[view["machine"].isin(machine_sel)]
+
+if risk_sel:
+    view = view[view["risk_final"].isin(risk_sel)]
+
+if show_only_wash:
+    view = view[view["washdown_required"] == True]
+
+if show_only_chg:
+    view = view[view["changeover_required"] == True]
+
+# Sort nicely
+sort_cols = []
+if "machine" in view.columns: sort_cols.append("machine")
+if "sequence" in view.columns: sort_cols.append("sequence")
+if sort_cols:
+    view = view.sort_values(sort_cols, na_position="last")
+
+# ----------------------------
+# Summary KPIs
+# ----------------------------
+st.subheader("📊 Summary")
+summary = compute_summary(view)
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Total", summary["Total rows"])
+c2.metric("Washdowns", summary["Washdowns"])
+c3.metric("Changeovers", summary["Changeovers"])
+c4.metric("High/Critical risk", summary["High/Critical risk"])
+c5.metric("Missing machine", summary["Missing machine"])
+
+# ----------------------------
+# Highlight tables
+# ----------------------------
+st.subheader("🚨 Attention list (Washdown / Changeover / High Risk)")
+
+attention = view.copy()
+attention["risk_flag"] = attention["risk_final"].str.lower().isin(["high", "critical"])
+attention = attention[
+    (attention["washdown_required"]) |
+    (attention["changeover_required"]) |
+    (attention["risk_flag"])
+].copy()
+
+attention_cols = [
+    "machine", "sequence", "product_name", "pack_size_g", "flavour_label",
+    "risk_final", "risk_reason",
+    "changeover_required", "changeover_reason",
+    "washdown_required", "washdown_reason",
+    "action"
+]
+attention = attention[[c for c in attention_cols if c in attention.columns]]
+
+st.dataframe(attention, use_container_width=True, height=320)
+
+# ----------------------------
+# Full plan
+# ----------------------------
+st.subheader("📋 Full sequenced plan (filtered)")
+
+plan_cols = [
+    "machine", "sequence", "product_name", "pack_size_g", "flavour_label",
+    "is_plain_yoghurt", "risk_final",
+    "changeover_required", "washdown_required",
+    "action"
+]
+plan = view[[c for c in plan_cols if c in view.columns]].copy()
+st.dataframe(plan, use_container_width=True, height=420)
+
+# ----------------------------
+# Download
+# ----------------------------
+st.subheader("⬇️ Download")
+csv_bytes = view.to_csv(index=False).encode("utf-8")
+st.download_button(
+    "Download filtered CSV",
+    data=csv_bytes,
+    file_name="agent_dashboard_view.csv",
+    mime="text/csv"
+)
+
