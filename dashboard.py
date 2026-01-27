@@ -3,6 +3,14 @@ import glob
 import pandas as pd
 import streamlit as st
 
+files = sorted(glob.glob("Outputs/agent_decisions*.csv"))
+
+if not files:
+    st.error("No agent output found.")
+    st.stop()
+
+df = pd.read_csv(files[-1])
+
 st.set_page_config(page_title="Yoghurt AI Agent Dashboard", layout="wide")
 
 st.title("🧠 Yoghurt AI Agent Dashboard")
